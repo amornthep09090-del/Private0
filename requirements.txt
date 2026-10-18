@@ -1,5 +1,7 @@
-numpy
-pandas
-requests
 yfinance
+pandas
+numpy
 scikit-learn
+requests
+tzdata
+tvdatafeed-enhanced
