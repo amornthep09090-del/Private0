@@ -1,6 +1,8 @@
 """
-Exness Gold AI Bot v3
+Gold AI Bot v4 (Eightcap)
+- ดึงราคาจาก Eightcap (EIGHTCAP:XAUUSD ผ่าน TradingView) — ไม่ต้องชดเชย offset แบบ GC=F อีกต่อไป
 - วางแผน "ออเดอร์รอ" (BUY/SELL LIMIT) ล่วงหน้า จากจุดที่หลายเครื่องมือมาบรรจบกัน (confluence)
+- ทุกออเดอร์บอก "เหตุผลที่วาง" และ "ให้เข้า/ดูที่ TF ไหน"
 - ติดตามวงจรออเดอร์: รอรับ -> เข้าแล้ว -> TP1 (เลื่อนทุน) -> TP2 / SL / ยกเลิกถ้าไม่มารับ
 - สรุปข่าวทุกเช้า + หยุดวาง/ยกเลิกออเดอร์รอก่อนข่าวแรง
 - แยก Discord 3 ช่อง: สัญญาณ / แจ้งเตือนผลออเดอร์ / ข่าว
@@ -42,11 +44,21 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")          # ช่อ�
 DISCORD_WEBHOOK_RESULTS = os.getenv("DISCORD_WEBHOOK_RESULTS", "")  # ช่องแจ้งเตือน: เข้าแล้ว/TP/SL/ยกเลิก
 DISCORD_WEBHOOK_NEWS = os.getenv("DISCORD_WEBHOOK_NEWS", "")        # ช่องข่าว
 
-# --- ข้อมูลราคา ---
-SYMBOL_YF = os.getenv("SYMBOL_YF", "GC=F")
-EXNESS_PRICE_OFFSET = _f("EXNESS_PRICE_OFFSET", "0.0")   # GC=F สูงกว่า Exness 12.5 -> ตั้ง -12.5 (ขยับตามการ roll สัญญา ควรเช็คเป็นระยะ)
-POINTS_PER_DOLLAR = _f("POINTS_PER_DOLLAR", "100")       # เช็คใน MT5: ทศนิยม XAUUSDm 2 หลัก = 100, 3 หลัก = 1000
+# --- ข้อมูลราคา: Eightcap ผ่าน TradingView ---
+DATA_SOURCE = os.getenv("DATA_SOURCE", "eightcap").strip().lower()   # eightcap (ค่าเริ่มต้น) | yfinance (สำรอง)
+TV_SYMBOL = os.getenv("TV_SYMBOL", "XAUUSD")             # ชื่อ symbol บน TradingView ของ Eightcap
+TV_EXCHANGE = os.getenv("TV_EXCHANGE", "EIGHTCAP")
+TV_NAIVE_TZ = os.getenv("TV_NAIVE_TZ", "UTC")            # โซนเวลาของเซิร์ฟเวอร์ที่รันบอท (Railway = UTC) ใช้แปลงเวลาแท่งเทียน
+TV_USERNAME = os.getenv("TV_USERNAME", "")               # ไม่ใส่ก็ได้ ถ้าข้อมูลล่าช้า/ไม่ครบ ค่อยใส่บัญชี TradingView
+TV_PASSWORD = os.getenv("TV_PASSWORD", "")
+TRADE_SYMBOL = os.getenv("TRADE_SYMBOL", "XAUUSD")       # ชื่อที่แสดงในข้อความ — ให้ตรงกับชื่อใน MT5 ของ Eightcap
+PRICE_OFFSET = _f("PRICE_OFFSET", "0.0")                 # ปกติ 0 สำหรับ Eightcap (ใช้เฉพาะโหมด yfinance ที่ราคาต่างจากโบรกเกอร์)
+SYMBOL_YF = os.getenv("SYMBOL_YF", "GC=F")               # ใช้ดึงพาดหัวข่าว (และเป็นแหล่งราคาในโหมด yfinance)
+POINTS_PER_DOLLAR = _f("POINTS_PER_DOLLAR", "100")       # เช็คใน MT5: ทศนิยม XAUUSD 2 หลัก = 100, 3 หลัก = 1000
 STALE_MINUTES = _f("STALE_MINUTES", "15")
+
+if os.getenv("EXNESS_PRICE_OFFSET"):
+    logging.warning("EXNESS_PRICE_OFFSET ไม่ได้ใช้แล้ว (ข้อมูลมาจาก Eightcap โดยตรง) — ลบทิ้งใน Railway ได้ ถ้าจำเป็นใช้ PRICE_OFFSET แทน")
 
 # --- เกณฑ์สัญญาณ ---
 CONFIDENCE_THRESHOLD = _f("CONFIDENCE_THRESHOLD", "0.72")
@@ -191,6 +203,7 @@ EXTRA_COLUMNS = {
     "closed_at": "TEXT", "strategy_ver": "INTEGER DEFAULT 1", "f_news": "REAL DEFAULT 0.7",
     "order_type": "TEXT", "tp1_price": "REAL", "tp1_points": "INTEGER",
     "filled_at": "TEXT", "tp1_hit_at": "TEXT", "result_r": "REAL", "cancel_reason": "TEXT", "cancel_price": "REAL",
+    "entry_tf": "TEXT", "reason_text": "TEXT",
 }
 
 
@@ -277,19 +290,27 @@ class SelfLearningEngine:
         return dict(row) if row else None
 
     def record_plan(self, plan, feats, conf):
+        params = {
+            'ts': datetime.now(timezone.utc).isoformat(), 'direction': plan['direction'], 'order_type': plan['order_type'],
+            'entry': plan['entry'], 'sl': plan['sl'], 'tp1': plan['tp1'], 'tp2': plan['tp2'],
+            'tp1_pts': plan['tp1_points'], 'tp2_pts': plan['tp2_points'], 'sl_pts': plan['sl_points'],
+            'cancel_price': plan['cancel_price'],
+            'f_trend': feats['f_trend'], 'f_wyckoff': feats['f_wyckoff'], 'f_elliott': feats['f_elliott'],
+            'f_vp_poc': feats['f_vp_poc'], 'f_gamma': feats['f_gamma'], 'f_m1_confirm': feats['f_m1_confirm'],
+            'f_news': feats['f_news'], 'conf': conf, 'ver': STRATEGY_VERSION,
+            'entry_tf': plan['entry_tf'], 'reason_text': "\n".join(f"• {x}" for x in plan['reason_lines']),
+        }
         with self._connect() as conn, conn:
             cur = conn.execute(
                 '''INSERT INTO signals
                    (timestamp, direction, order_type, entry_price, sl_price, tp1_price, tp_price,
                     tp1_points, tp_points, sl_points, cancel_price,
                     f_trend, f_wyckoff, f_elliott, f_vp_poc, f_gamma, f_m1_confirm, f_news,
-                    confidence, status, strategy_ver)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING',?)''',
-                (datetime.now(timezone.utc).isoformat(), plan['direction'], plan['order_type'],
-                 plan['entry'], plan['sl'], plan['tp1'], plan['tp2'],
-                 plan['tp1_points'], plan['tp2_points'], plan['sl_points'], plan['cancel_price'],
-                 feats['f_trend'], feats['f_wyckoff'], feats['f_elliott'], feats['f_vp_poc'],
-                 feats['f_gamma'], feats['f_m1_confirm'], feats['f_news'], conf, STRATEGY_VERSION))
+                    confidence, status, strategy_ver, entry_tf, reason_text)
+                   VALUES (:ts, :direction, :order_type, :entry, :sl, :tp1, :tp2,
+                           :tp1_pts, :tp2_pts, :sl_pts, :cancel_price,
+                           :f_trend, :f_wyckoff, :f_elliott, :f_vp_poc, :f_gamma, :f_m1_confirm, :f_news,
+                           :conf, 'PENDING', :ver, :entry_tf, :reason_text)''', params)
             return cur.lastrowid
 
     @staticmethod
@@ -297,6 +318,7 @@ class SelfLearningEngine:
         ev = {'id': r['id'], 'type': etype, 'direction': r['direction'], 'order_type': r.get('order_type') or r['direction'],
               'entry': r['entry_price'], 'sl': r['sl_price'], 'tp1': r.get('tp1_price'), 'tp2': r['tp_price'],
               'sl_pts': r['sl_points'], 'tp1_pts': r.get('tp1_points'), 'tp2_pts': r['tp_points'],
+              'entry_tf': r.get('entry_tf'), 'reason_text': r.get('reason_text'),
               'price': None, 'pts': None, 'reason': None, 'result_r': None}
         ev.update(kw)
         return ev
@@ -422,38 +444,85 @@ class SelfLearningEngine:
                                 (STRATEGY_VERSION, cutoff)).fetchone()[0]
 
 
-# ==================== 2. ดึงข้อมูลกราฟ ====================
+# ==================== 2. ดึงข้อมูลกราฟ (Eightcap ผ่าน TradingView) ====================
 class DataFeed:
+    YF_PERIOD = {"1h": "1mo", "15m": "5d", "1m": "2d"}
+    TV_BARS = {"1h": 700, "15m": 600, "1m": 1500}
+
     def __init__(self):
-        self.ticker = yf.Ticker(SYMBOL_YF)
+        self.use_tv = DATA_SOURCE in ("eightcap", "tradingview", "tv")
+        self.ticker = None if self.use_tv else yf.Ticker(SYMBOL_YF)
+        self._tv = None
         self._h1_cache = (0.0, None)
 
-    def _history(self, period, interval):
+    def source_label(self):
+        if self.use_tv:
+            return f"Eightcap ({TV_EXCHANGE}:{TV_SYMBOL} ผ่าน TradingView)"
+        return f"Yahoo {SYMBOL_YF} (offset {PRICE_OFFSET:+g})"
+
+    def _tv_client(self):
+        if self._tv is None:
+            try:
+                from tvDatafeed import TvDatafeed
+            except ImportError as e:
+                raise RuntimeError("ยังไม่ได้ติดตั้ง tvdatafeed-enhanced — เพิ่มลง requirements.txt แล้ว redeploy") from e
+            self._tv = TvDatafeed(TV_USERNAME, TV_PASSWORD) if (TV_USERNAME and TV_PASSWORD) else TvDatafeed()
+        return self._tv
+
+    def _raw_tv(self, interval):
+        from tvDatafeed import Interval
+        iv = {"1m": Interval.in_1_minute, "15m": Interval.in_15_minute, "1h": Interval.in_1_hour}[interval]
+        df = self._tv_client().get_hist(symbol=TV_SYMBOL, exchange=TV_EXCHANGE, interval=iv,
+                                        n_bars=self.TV_BARS[interval])
+        if df is None or len(df) == 0:
+            raise ValueError(f"TradingView ไม่ส่งข้อมูล {TV_EXCHANGE}:{TV_SYMBOL} ({interval})")
+        df = df.rename(columns=str.capitalize)
+        if 'Volume' not in df.columns:
+            df['Volume'] = 0.0
+        df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+        idx = pd.DatetimeIndex(df.index)
+        if idx.tz is None:      # tvdatafeed ส่งเวลาแบบไม่มีโซน = เวลาท้องถิ่นของเครื่องที่รันบอท
+            idx = idx.tz_localize(TV_NAIVE_TZ, ambiguous="NaT", nonexistent="shift_forward")
+        df.index = idx.tz_convert("UTC")
+        df = df[~df.index.isna()]
+        return df[~df.index.duplicated(keep="last")].sort_index()
+
+    def _history(self, interval):
         last_err = None
         for attempt in range(3):
             try:
-                df = self.ticker.history(period=period, interval=interval)
+                if self.use_tv:
+                    df = self._raw_tv(interval)
+                else:
+                    df = self.ticker.history(period=self.YF_PERIOD[interval], interval=interval)
                 if df is not None and not df.empty:
                     df = df.copy().dropna(subset=['Open', 'High', 'Low', 'Close'])
-                    for col in ['Open', 'High', 'Low', 'Close']:
-                        df[col] = df[col] + EXNESS_PRICE_OFFSET
+                    if PRICE_OFFSET:
+                        for col in ['Open', 'High', 'Low', 'Close']:
+                            df[col] = df[col] + PRICE_OFFSET
                     return df
                 last_err = ValueError(f"ได้ข้อมูลว่าง ({interval})")
             except Exception as e:
                 last_err = e
+                if self.use_tv:
+                    self._tv = None      # สร้างการเชื่อมต่อใหม่ในรอบถัดไป
             time.sleep(2 * (attempt + 1))
         raise last_err
 
     def fetch(self):
         ts, h1 = self._h1_cache
         if h1 is None or time.time() - ts > 300:
-            h1 = self._history("1mo", "1h")
+            h1 = self._history("1h")
             self._h1_cache = (time.time(), h1)
-        m15 = self._history("5d", "15m")
-        m1 = self._history("2d", "1m")
-        h4 = drop_forming(h1, 60).resample('4h').agg(
+        m15 = self._history("15m")
+        m1 = self._history("1m")
+        # H4 ตัดแท่งแบบอิงเวลาปิดตลาดนิวยอร์ก (เริ่ม 17:00 NY) ให้ตรงกับ H4 ใน MT5 ส่วนใหญ่
+        h1_ny = drop_forming(h1, 60).tz_convert(NY_TZ)
+        h4 = h1_ny.resample('4h', offset='1h').agg(
             {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna()
         lag_min = (pd.Timestamp.now(tz="UTC") - m1.index[-1].tz_convert("UTC")).total_seconds() / 60
+        if lag_min < -3:
+            raise ValueError(f"เวลาแท่งล่าสุดอยู่ในอนาคต {abs(lag_min):.0f} นาที — ตั้ง TV_NAIVE_TZ ให้ตรงกับโซนเวลาของเซิร์ฟเวอร์")
         return {'H4': h4, 'H1': h1, 'M15': m15, 'M1': m1, 'lag_min': lag_min}
 
 
@@ -504,6 +573,26 @@ def news_feature(buy, bias):
     return 0.2
 
 
+def choose_entry_tf(cluster, dist_atr):
+    """
+    เลือก TF ที่ควรเปิดกราฟดู/วางจุดเข้า/จัดการไม้ — ดูจาก "โซนนี้สร้างมาจาก TF ไหนเป็นหลัก"
+    (Fib และ EMA50 มาจาก H1 / POC และแนวรับ-ต้านมาจาก M15)
+    ปรับกติกาได้ที่ฟังก์ชันนี้ที่เดียว
+    """
+    total = sum(l[2] for l in cluster)
+    h1_share = sum(l[2] for l in cluster if l[3] == "H1") / total
+    if h1_share >= 0.6:
+        if dist_atr >= 2.0:
+            return "H1", (f"โซนนี้สร้างจาก H1 เป็นหลัก ({h1_share*100:.0f}%) และอยู่ลึก {dist_atr:.1f} ATR "
+                          "→ เป็นไม้ย่อลึก เปิด H1 ดูโครงสร้างและแท่งปิดยืนยัน")
+        return "M15", (f"โซนนี้สร้างจาก H1 เป็นหลัก ({h1_share*100:.0f}%) "
+                       "→ ใช้ M15 หาจุดวางและวาง SL ให้พ้นไส้เทียนแม่นขึ้น")
+    if h1_share <= 0.3:
+        return "M5", (f"โซนนี้สร้างจากโครงสร้าง M15 (POC/แนวรับ-ต้าน) ซึ่งแคบ ({(1-h1_share)*100:.0f}%) "
+                      "→ เปิด M5 เพื่อวางจุดเข้าและดูแท่งตอบรับให้ละเอียด")
+    return "M15", f"โซนผสมระหว่าง H1 ({h1_share*100:.0f}%) และ M15 → ใช้ M15 เป็นหลัก"
+
+
 def plan_order(ctx, news_bias=0.0):
     """หาจุดวาง Limit ที่เครื่องมือหลายตัวมาบรรจบกันมากที่สุด ในฝั่งเดียวกับเทรนด์ใหญ่"""
     td = ctx['trend_dir']
@@ -518,16 +607,17 @@ def plan_order(ctx, news_bias=0.0):
     sr_name = "แนวรับ M15" if buy else "แนวต้าน M15"
     sr = m15c['Low'].iloc[-31:].min() if buy else m15c['High'].iloc[-31:].max()
 
+    # แต่ละระดับ = (ชื่อ, ราคา, น้ำหนัก, TF ที่ระดับนี้มาจาก)
     levels = []
     for ratio, w in ((0.382, 0.6), (0.5, 1.0), (0.618, 1.0)):
-        levels.append((f"Fib {ratio*100:g}%", sw_hi - ratio * rng if buy else sw_lo + ratio * rng, w))
-    levels += [("POC", poc, 1.0), (sr_name, float(sr), 1.0), ("EMA50 H1", ctx['ema_h1'], 0.8)]
+        levels.append((f"Fib {ratio*100:g}%", sw_hi - ratio * rng if buy else sw_lo + ratio * rng, w, "H1"))
+    levels += [("POC", poc, 1.0, "M15"), (sr_name, float(sr), 1.0, "M15"), ("EMA50 H1", ctx['ema_h1'], 0.8, "H1")]
 
     mind, maxd = PULLBACK_MIN_ATR * atr, PULLBACK_MAX_ATR * atr
     lo_w, hi_w = (p - maxd, p - mind) if buy else (p + mind, p + maxd)
     k = math.ceil(lo_w / 10.0) * 10
     while k <= hi_w:
-        levels.append((f"เลขกลม {k:.0f}", float(k), 0.4))
+        levels.append((f"เลขกลม {k:.0f}", float(k), 0.4, "M15"))
         k += 10
 
     cands = [l for l in levels if lo_w <= l[1] <= hi_w]
@@ -535,7 +625,7 @@ def plan_order(ctx, news_bias=0.0):
         return None
     tol = CLUSTER_TOL_ATR * atr
     best = None
-    for _, px, _ in cands:
+    for _, px, _, _ in cands:
         cluster = [l for l in cands if abs(l[1] - px) <= tol]
         key = (sum(l[2] for l in cluster), -abs(px - p))
         if best is None or key > best[0]:
@@ -589,12 +679,47 @@ def plan_order(ctx, news_bias=0.0):
             feats['f_vp_poc'] * 0.15 + feats['f_gamma'] * 0.08 + feats['f_m1_confirm'] * 0.10 + feats['f_news'] * 0.12)
     passes = [wyckoff >= 0.78, elliott >= 0.8, vp >= 0.8, gamma >= 0.8, news >= 0.7]
 
+    # ---- เหตุผล + TF ที่ควรเข้า ----
+    dist_atr = abs(p - entry) / atr
+    entry_tf, entry_tf_reason = choose_entry_tf(cluster, dist_atr)
+    zone_desc = [f"{l[0]} @ {l[1]:.2f} ({l[3]})" for l in sorted(cluster, key=lambda l: -l[2])]
+
+    rel = "เหนือ" if buy else "ใต้"
+    slope_txt = (" และ EMA50 H1 ชัน" + ("ขึ้น" if buy else "ลง") + "ยืนยัน") if ctx['trend_score'] >= 1.0 \
+        else " (แต่ EMA50 H1 ยังไม่ชันชัด)"
+    reasons = [
+        f"เทรนด์ใหญ่{'ขาขึ้น' if buy else 'ขาลง'}: ราคา {p:.2f} อยู่{rel} EMA50 ทั้ง H4 และ H1{slope_txt} → เล่นตามเทรนด์เท่านั้น",
+        f"{'รอราคาย่อลงมา' if buy else 'รอราคาเด้งขึ้นไป'}ที่ {zone:.2f} (ห่าง {dist_atr:.1f} ATR) "
+        f"เพราะมี {len(cluster)} จุดซ้อนกัน: " + " · ".join(zone_desc) + f" (คะแนนซ้อน {confluence:.1f})",
+    ]
+    if spring:
+        reasons.append(("พบ Spring (ราคากวาดต่ำกว่าแนวรับแล้วปิดกลับขึ้น)" if buy else
+                        "พบ Upthrust (ราคากวาดเหนือแนวต้านแล้วปิดกลับลง)") + " ใน 6 แท่ง M15 ล่าสุด")
+    if approaching:
+        reasons.append("M1 ยืนยันว่าราคากำลังเคลื่อนเข้าหาโซนนี้")
+    if news >= 0.9:
+        reasons.append("ข่าวเช้าหนุนทิศทางเดียวกับออเดอร์นี้")
+    elif news >= 0.7:
+        reasons.append("ข่าวเช้าไม่สวนทาง (เป็นกลาง)")
+    else:
+        reasons.append("⚠️ ข่าวเช้าค่อนไปทางสวนทิศนี้ (ถูกหักคะแนนแล้ว) ระวังเป็นพิเศษ")
+    if gamma >= 0.8:
+        reasons.append(f"ความผันผวนปกติ ({ctx['vol_ratio']:.2f}× ของค่าเฉลี่ย) → SL/TP น่าเชื่อถือ")
+    else:
+        reasons.append(f"⚠️ ความผันผวนผิดปกติ ({ctx['vol_ratio']:.2f}× ของค่าเฉลี่ย) ระวังสเปรดและไส้เทียนยาว")
+    if atr * ATR_SL_MULT >= MIN_SL_USD:
+        sl_why = f"{ATR_SL_MULT:g}×ATR M15 (ATR = {atr:.2f}$)"
+    else:
+        sl_why = f"ขั้นต่ำ {MIN_SL_USD:g}$ (ATR M15 = {atr:.2f}$ แคบเกินไป)"
+    reasons.append(f"SL ห่าง {sl_dist:.2f}$ = {sl_why} วางพ้นช่วงแกว่งปกติ · TP1 = {TP1_R:g}R · TP2 = {TP2_R:g}R")
+
     return {
         'direction': "BUY" if buy else "SELL", 'order_type': "BUY LIMIT" if buy else "SELL LIMIT",
         'entry': entry, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'cancel_price': round(p + sgn * RUNAWAY_R * sl_dist, 2),
         'sl_points': pts_of(sl_dist), 'tp1_points': pts_of(TP1_R * sl_dist), 'tp2_points': pts_of(TP2_R * sl_dist),
-        'zone_names': names, 'confluence': confluence, 'price': round(p, 2), 'poc': round(poc, 2),
+        'zone_names': names, 'zone_desc': zone_desc, 'confluence': confluence, 'price': round(p, 2), 'poc': round(poc, 2),
         'features': feats, 'base_score': base, 'confirmations': sum(passes), 'spring': bool(spring),
+        'entry_tf': entry_tf, 'entry_tf_reason': entry_tf_reason, 'reason_lines': reasons, 'dist_atr': dist_atr,
     }
 
 
@@ -613,7 +738,7 @@ def send_discord_alert(title, description, color=0xFFD700, channel="signal"):
         logging.warning(f"ยังไม่ได้ตั้งค่า webhook ของช่อง '{channel}' บน Railway!")
         return False
     payload = {
-        "username": "Exness Gold AI Bot",
+        "username": "Gold AI Bot",
         "allowed_mentions": {"parse": []},     # กัน @everyone จากข้อความข่าวที่ดึงมา
         "embeds": [{"title": title[:250], "description": description[:4000], "color": color,
                     "timestamp": datetime.now(timezone.utc).isoformat()}],
@@ -709,7 +834,7 @@ class NewsDesk:
         self._loaded_at = time.time()
         for url in NEWS_CALENDAR_URLS:
             try:
-                r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 (compatible; GoldBot/3.0)"})
+                r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 (compatible; GoldBot/4.0)"})
                 r.raise_for_status()
                 self.events, self._ok = self._parse_calendar(r.json()), True
                 logging.info(f"📅 โหลดปฏิทินข่าวแล้ว: {len(self.events)} รายการ ({NEWS_COUNTRIES}/{NEWS_IMPACTS})")
@@ -739,7 +864,7 @@ class NewsDesk:
             logging.warning(f"ดึงข่าวจาก yfinance ไม่สำเร็จ: {e}")
         for url in NEWS_RSS_URLS:
             try:
-                r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 (compatible; GoldBot/3.0)"})
+                r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0 (compatible; GoldBot/4.0)"})
                 r.raise_for_status()
                 for item in list(ET.fromstring(r.content).iter('item'))[:20]:
                     t = item.findtext('title')
@@ -882,13 +1007,31 @@ class GoldBot:
         self.errors = 0
         self.error_alerted = False
 
+    def _feed_selftest(self):
+        """ทดสอบดึงข้อมูลตอนสตาร์ท เพื่อให้เห็นทันทีว่า symbol/โซนเวลาถูกไหม"""
+        try:
+            d = self.feed.fetch()
+            last = float(d['M1']['Close'].iloc[-1])
+            txt = f"✅ ดึงข้อมูลได้ · ราคาล่าสุด `{last:.2f}` · แท่งล่าสุดล่าช้า `{d['lag_min']:.0f}` นาที"
+            if d['lag_min'] > 60:
+                if is_gold_market_open()[0]:
+                    txt += "\n⚠️ ตลาดเปิดแต่ข้อมูลล่าช้ามาก — เช็ค TV_NAIVE_TZ หรือใส่ TV_USERNAME/TV_PASSWORD"
+                else:
+                    txt += " (ตลาดปิดอยู่ ล่าช้าเป็นเรื่องปกติ)"
+            return txt
+        except Exception as e:
+            return f"❌ ดึงข้อมูลไม่ได้: `{str(e)[:250]}`"
+
     def announce_start(self):
         warn = "" if DB_PERSISTENT else "\n⚠️ **ยังไม่ได้เชื่อม Railway Volume (/data)** — ความจำ AI จะหายเมื่อ redeploy"
+        if self.feed.use_tv and PRICE_OFFSET:
+            warn += f"\n⚠️ PRICE_OFFSET = `{PRICE_OFFSET:+g}` ถูกบวกเข้าราคา Eightcap — ปกติควรเป็น 0"
         ch = (f"สัญญาณ ✅ | แจ้งเตือน {'✅' if DISCORD_WEBHOOK_RESULTS else '➡️ใช้ช่องสัญญาณ'} | "
               f"ข่าว {'✅' if DISCORD_WEBHOOK_NEWS else '➡️ใช้ช่องสัญญาณ'}")
         send_discord_alert(
-            "🤖 บอททองคำ AI v3 เริ่มทำงานแล้ว",
+            "🤖 บอททองคำ AI v4 (Eightcap) เริ่มทำงานแล้ว",
             f"โหมด: วางแผนออเดอร์รอ (Limit) · แจ้งเตือนอย่างเดียว ไม่ส่งคำสั่งเข้า MT5\n"
+            f"แหล่งราคา: {self.feed.source_label()}\n{self._feed_selftest()}\n"
             f"ช่อง Discord: {ch}\nวิเคราะห์ข่าว: {'AI (Claude)' if ANTHROPIC_API_KEY else 'คีย์เวิร์ด'} · สรุปเช้า {MORNING_BRIEF_TIME} น.\n"
             f"เกณฑ์คะแนน `{CONFIDENCE_THRESHOLD*100:.0f}%` · Confluence ≥ `{MIN_CONFLUENCE:g}` · ผ่านเงื่อนไข ≥ `{MIN_CONFIRMATIONS}/5`\n"
             f"ฐานข้อมูล: `{DB_PATH}`\nสถิติ: {format_stats(self.brain.get_stats())}{warn}",
@@ -918,13 +1061,18 @@ class GoldBot:
             t, head = ev['type'], f"#{ev['id']} {ev['order_type']}"
             stats = lambda: format_stats(self.brain.get_stats())
             if t == "FILLED":
+                why = ""
+                if ev.get('entry_tf'):
+                    why += f"\n**⏱️ เปิดกราฟดู/จัดการไม้ที่ TF:** {ev['entry_tf']}"
+                if ev.get('reason_text'):
+                    why += f"\n\n**📍 ที่มาของออเดอร์นี้:**\n{ev['reason_text']}"
                 send_discord_alert(
                     f"🔔 ออเดอร์เข้าแล้ว {head}",
                     f"**{ev['direction']}** ที่ `{ev['entry']}` ถูกรับแล้ว\n\n**แผนเก็บกำไร:**\n"
                     f"• **TP1** `{ev['tp1']}` = **+{ev['tp1_pts']} จุด** → ปิด {pct:g}% แล้ว **เลื่อน SL มาที่ทุน** `{ev['entry']}`\n"
                     f"• **TP2** `{ev['tp2']}` = **+{ev['tp2_pts']} จุด** → ปิดส่วนที่เหลือ\n"
                     f"• **SL** `{ev['sl']}` = **-{ev['sl_pts']} จุด**\n\n"
-                    f"ถ้าเลื่อนทุนแล้วราคากลับมาชนทุน = ได้กำไรจากส่วนแรกไว้แล้ว",
+                    f"ถ้าเลื่อนทุนแล้วราคากลับมาชนทุน = ได้กำไรจากส่วนแรกไว้แล้ว{why}",
                     color=0x3498DB, channel="results")
             elif t == "TP1":
                 send_discord_alert(
@@ -1040,25 +1188,28 @@ class GoldBot:
         valid_until = pd.Timestamp(now_utc) + pd.Timedelta(hours=PENDING_EXPIRY_HOURS)
         dist = abs(plan['price'] - plan['entry'])
         tag = "🔥 คะแนนสูงมาก" if conf >= 0.80 else "✅ ผ่านเกณฑ์"
+        reason_block = "\n".join(f"• {x}" for x in plan['reason_lines'])
+        spring_txt = " · พบ Spring/Upthrust" if plan['spring'] else ""
         msg = (
-            f"**วาง:** `{plan['order_type']} XAUUSDm` ที่ **{plan['entry']}**  _(ราคาตอนนี้ {plan['price']} · ห่าง {dist:.2f}$)_\n"
+            f"**วาง:** `{plan['order_type']} {TRADE_SYMBOL}` ที่ **{plan['entry']}**  _(ราคาตอนนี้ {plan['price']} · ห่าง {dist:.2f}$)_\n"
+            f"**⏱️ เข้าที่ TF: {plan['entry_tf']}** — {plan['entry_tf_reason']}\n"
+            f"_ทิศทางดูจาก H4+H1 · แหล่งราคา Eightcap_\n\n"
             f"**SL:** `{plan['sl']}` (-{plan['sl_points']} จุด)\n"
             f"**TP1:** `{plan['tp1']}` (+{plan['tp1_points']} จุด) → ปิด {TP1_CLOSE_PCT:g}% แล้วเลื่อน SL มาทุน\n"
             f"**TP2:** `{plan['tp2']}` (+{plan['tp2_points']} จุด) → ปิดส่วนที่เหลือ\n"
             f"**ใช้ได้ถึง:** `{th_hm(valid_until)}` น. (ไทย)\n\n"
             f"**🚫 ยกเลิกทิ้งถ้า:** ราคาวิ่งหนีไปถึง `{plan['cancel_price']}` โดยยังไม่ย่อมารับ · เกินเวลา · ข่าวแรง · เทรนด์กลับทิศ "
             f"(บอทจะแจ้งในช่องแจ้งเตือน)\n\n"
-            f"**📍 ทำไมวางตรงนี้ (Confluence {plan['confluence']:.1f}):** {', '.join(plan['zone_names'])}\n"
-            f"**{tag}** `{conf*100:.1f}%` · ผ่านเงื่อนไขยืนยัน **{plan['confirmations']}/5**"
-            f"{' · พบ Spring/Upthrust' if plan['spring'] else ''}\n\n"
-            f"**📐 รายละเอียด:**\n"
+            f"**📍 เหตุผลที่วางออเดอร์นี้:**\n{reason_block}\n\n"
+            f"**{tag}** `{conf*100:.1f}%` · ผ่านเงื่อนไขยืนยัน **{plan['confirmations']}/5**{spring_txt}\n\n"
+            f"**📐 รายละเอียดคะแนน:**\n"
             f"• เทรนด์ H4+H1: `{f['f_trend']*100:.0f}%` · Wyckoff/โครงสร้าง: `{f['f_wyckoff']*100:.0f}%`\n"
             f"• Fib Zone: `{f['f_elliott']*100:.0f}%` · Volume Profile (POC {plan['poc']}): `{f['f_vp_poc']*100:.0f}%`\n"
             f"• Volatility: `{f['f_gamma']*100:.0f}%` · ราคากำลังย่อเข้าหาโซน: `{f['f_m1_confirm']*100:.0f}%` · ข่าว: `{f['f_news']*100:.0f}%`\n\n"
             f"**📊 สถิติ:** {format_stats(self.brain.get_stats())}\n"
             f"_คะแนนคือค่าถ่วงน้ำหนักของตัวชี้วัด ไม่ใช่ความน่าจะเป็นที่จะชนะ · ข้อมูลล่าช้า ~{data['lag_min']:.1f} นาที_"
         )
-        send_discord_alert(f"📌 แผนออเดอร์รอ #{oid}: {plan['order_type']} XAUUSD", msg,
+        send_discord_alert(f"📌 แผนออเดอร์รอ #{oid}: {plan['order_type']} {TRADE_SYMBOL} (TF {plan['entry_tf']})", msg,
                            color=0x00FF7F if plan['direction'] == "BUY" else 0xFF3366, channel="signal")
 
 
